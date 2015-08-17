@@ -1,0 +1,162 @@
+#!/usr/bin/env ruby
+
+require 'slop'
+require 'aws-sdk'
+require 'yaml'
+
+module AWSSH
+  class Runner
+    DEFAULT_OPTIONS = {
+      'user'    => ENV['user'],
+      'format'  => 'ssh',
+      'verbose' => false
+    }
+
+    attr_accessor :host_regex
+
+    def run
+      self.host_regex = cli.args.first
+      exit_error! 'AWS Region not set' unless cli[:region]
+      exit_error! 'AWS Profile not set' unless cli[:profile]
+
+      shout "Hostname: #{host_regex}"
+      shout "Options: #{cli.to_h.inspect}"
+      shout "Defaults: #{defaults.inspect}"
+
+      Aws.config.merge!(profile: cli[:profile], region: cli[:region])
+
+      if cli['show-only']
+        print_output
+      else
+        ssh!
+      end
+    end
+
+    def cli
+      @cli ||= Slop.parse do |o|
+        o.banner = <<-USAGE
+awssh - a tool that makes easy to ssh into AWS EC2 servers
+
+Usage: awssh [hostname regex]
+
+Examples:
+  $ awssh prod.*app2
+  ... will SSH into the instance and you will see:
+  user@prod-rails-app4~$
+
+  $ awssh --show-only --stack qa -u worker
+  ... will show all instances registered in QA stack of Opsworks
+  ssh worker@10.20.30.40        => MyApp QA - qa-rails-app
+  ssh worker@10.20.30.41        => MyApp QA - qa-sidekiq
+
+  # All hosts in one-line (suitable for CSSH):
+  worker@10.20.30.40 worker@10.20.30.41
+        USAGE
+
+        o.separator "Options:"
+        o.string '-s',  '--stack',      'AWS OpsWorks Stack name regex. E.g: `-s prod` will match "Production" stack name'
+        o.string '-p',  '--profile',    'AWS config profile name. Default: profile set in .awssh file', default: defaults['profile']
+        o.string '-r',  '--region',     'AWS region. E.g: us-east-1. Default: region set in .awssh file', default: defaults['region']
+        o.string '-u',  '--user',       'SSH username to use. Default: user set in .awssh file or current machine user', default: defaults['user']
+        o.bool   '-so', '--show-only',  'Only show the matched hosts instead of ssh. Default: false', default: false
+        o.bool   '-cs', '--csensitive', 'Use case-sensitive for regex matching. Default: false', default: false
+        o.bool   '-v',  '--verbose',    'Verbose mode. Default: false', default: false
+        o.on '--help', 'Shows help' do
+          puts o
+          exit
+        end
+      end
+    end
+
+    def ssh!
+      if instances.size > 1
+        print_output
+        exit_error! "\nMultiple hostnames matched. Please be more specific in hostnames regex or use the last output line to use CSSH.\n"
+      end
+      exec "ssh #{connection_string(instances.first)}"
+    end
+
+    def print_output
+      instances.each do |i|
+        puts "ssh #{connection_string(i)}      \t => #{i.name}"
+      end
+      puts "\n# All hosts in one-line (suitable for CSSH):"
+      puts instances.map { |i| connection_string(i) }.join(' ')
+    end
+
+    def connection_string(instance)
+      "#{cli[:user]}@#{instance.ip}"
+    end
+
+    def defaults
+      @defaults ||= begin
+        defaults = File.exist?('.awssh') ? YAML.load_file('.awssh') : {}
+        DEFAULT_OPTIONS.merge(defaults)
+      end
+    end
+
+    def instances
+      @instances ||= AWSEC2.new.instances(host_regex, cli[:stack], cli[:csensitive]).select do |i|
+        shout "Instance #{i.name} is not part of an Opsworks Stack" unless i.stack_name
+        shout "Instance #{i.name} not running. Current state: #{i.state}" unless i.running?
+        i.running?
+      end
+    end
+
+    def exit_error!(msg)
+      $stderr.puts msg
+      exit(1)
+    end
+
+    def shout(msg)
+      puts "[DEBUG] #{msg}" if cli.verbose?
+    end
+  end
+
+  EC2Instance = Struct.new(:name, :hostname, :stack_name, :state, :ip) do
+    def initialize(instance)
+      name       = extract_tag(instance, 'Name')
+      hostname   = extract_tag(instance, 'opsworks:instance')
+      stack_name = extract_tag(instance, 'opsworks:stack')
+
+      super(name, hostname, stack_name, instance.state.name, instance.public_ip_address)
+    end
+
+    def running?
+      state == 'running'
+    end
+
+    def extract_tag(instance, tag)
+      tag = instance.tags.find { |t| t.key == tag }
+      tag ? tag.value : nil
+    end
+  end
+
+  class AWSEC2
+    def instances(host_regex, stack_regex, case_sensitive)
+      ec2.describe_instances.reservations.map(&:instances).flatten.map do |instance_data|
+        instance = EC2Instance.new(instance_data)
+        if stack_regex
+          next unless word_match?(instance.stack_name, stack_regex, case_sensitive)
+        end
+        if host_regex
+          next unless word_match?(instance.hostname, host_regex, case_sensitive)
+          next unless word_match?(instance.name, host_regex, case_sensitive)
+        end
+
+        instance
+      end.compact.sort_by(&:name)
+    end
+
+    def ec2
+      @ec2 ||= Aws::EC2::Client.new
+    end
+
+    def word_match?(value, regex_str, case_sensitive)
+      regex = case_sensitive ? /#{regex_str}/ : /#{regex_str}/i
+      !!(value =~ regex)
+    end
+  end
+end
+
+AWSSH::Runner.new.run
