@@ -25,11 +25,7 @@ module AWSSH
 
       Aws.config.merge!(profile: cli[:profile], region: cli[:region])
 
-      if cli['show-only']
-        print_output
-      else
-        ssh!
-      end
+      cli['show-only'] ? print_output : ssh!
     end
 
     def cli
